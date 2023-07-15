@@ -1,0 +1,7 @@
+
+def test(a: int) -> int:
+    return a
+
+
+def main() -> int:
+    return test(0)
