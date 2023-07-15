@@ -6,6 +6,15 @@ from __future__ import annotations
 
 from koine.sentinel import sentinel
 
+__all__ = [
+    'convert_and_store_undefined',
+    'load_undefined',
+    'store_undefined',
+    'Undefined',
+    'unwrap_undefined',
+    'wrap_undefined',
+]
+
 _, Undefined = sentinel('Undefined')
 
 

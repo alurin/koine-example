@@ -9,7 +9,7 @@ import ast
 import enum
 import itertools
 import sys
-from typing import Type, Sequence, TypeVar, Tuple, Iterator, cast, Generic, overload, AbstractSet
+from typing import Type, Sequence, TypeVar, Tuple, Iterator, cast, Generic, overload, AbstractSet, Mapping
 
 import prettyprinter
 from prettyprinter.prettyprinter import pretty_bracketable_iterable
@@ -113,6 +113,7 @@ class TokenID(enum.Enum):
     Using = make_unique_id(), 'using'
     VerticalLine = make_unique_id(), '|'
     VerticalLineEqual = make_unique_id(), '|='
+    Yield = make_unique_id(), 'yield'
     Where = make_unique_id(), 'where'
     While = make_unique_id(), 'while'
     Whitespace = make_unique_id(), 'whitespace'
@@ -193,6 +194,7 @@ IMPLICITS: AbstractSet[TokenID] = {
     TokenID.Star,
     TokenID.Tilde,
     TokenID.VerticalLine,
+    TokenID.Yield,
 }
 """ This set is contains implicit tokens """
 
@@ -216,6 +218,12 @@ CLOSE_BRACKETS: AbstractSet[TokenID] = {
     TokenID.RightSquare,
 }
 """ This set is contains tokens' identifier that used as close brackets """
+
+KEYWORDS_MAPPING: Mapping[str, TokenID] = {key_id.description: key_id for key_id in KEYWORDS}
+""" This mapping is contains keyword's identifier by it's value """
+
+CONTEXTUAL_MAPPING: Mapping[str, TokenID] = {key_id.description: key_id for key_id in CONTEXTUAL_KEYWORDS}
+""" This mapping is contains contextual keyword's identifier by it's value """
 
 
 # === Syntax: internal structs -----------------------------------------------------------------------------------------
@@ -304,6 +312,12 @@ class InternalToken(InternalSymbol):
     @property
     def id(self) -> TokenID:
         return self.__token_trivia.id
+
+    @property
+    def context_id(self) -> TokenID | None:
+        if self.id == TokenID.Identifier:
+            return CONTEXTUAL_MAPPING.get(self.value, None)
+        return None
 
     @property
     def value(self) -> str:
@@ -509,6 +523,10 @@ class SyntaxToken(SyntaxSymbol):
     @property
     def id(self) -> TokenID:
         return self.__internal.id
+
+    @property
+    def context_id(self) -> TokenID | None:
+        return self.__internal.context_id
 
     @property
     def value(self) -> str:
@@ -734,7 +752,7 @@ class ModuleSyntax(SyntaxNode):
     imports: Sequence[ImportSyntax]
     """ The tree's imports """
 
-    members: Sequence[FunctionSyntax]
+    members: Sequence[FunctionDeclarationSyntax]
     """ The tree's members """
 
     token_eof: SyntaxToken
@@ -926,11 +944,6 @@ class SeparatedModuleAliasSyntax(SyntaxNode):
         return self.alias.location
 
 
-# === Members ----------------------------------------------------------------------------------------------------------
-class MemberSyntax(SyntaxNode, abc.ABC):
-    """ Represents an abstract base for any member syntax nodes """
-
-
 # === Effects ----------------------------------------------------------------------------------------------------------
 class EffectSyntax(SyntaxNode, abc.ABC):
     """ Represents an abstract base for any effect syntax nodes """
@@ -1012,6 +1025,17 @@ class ExpansionTypeSyntax(TypeSyntax):
     @property
     def location(self) -> Location:
         return self.type.location
+
+
+class EllipsisTypeSyntax(TypeSyntax):
+    """ Represents an ellipsis type syntax node, e.g. node that marked empty using body """
+
+    token_ellipsis: SyntaxToken
+    """ The `...` token """
+
+    @property
+    def location(self) -> Location:
+        return self.token_ellipsis.location
 
 
 class IdentifierTypeSyntax(TypeSyntax):
@@ -1161,8 +1185,49 @@ class DoublePointerTypeSyntax(TypeSyntax):
     """ The `**` token """
 
 
+# === Members ----------------------------------------------------------------------------------------------------------
+class MemberSyntax(SyntaxNode, abc.ABC):
+    """ Represents an abstract base for any member syntax nodes """
+
+
+# === Basis members ----------------------------------------------------------------------------------------------------
+class PassMemberSyntax(MemberSyntax):
+    """ Represents a pass member syntax node """
+
+    token_pass: SyntaxToken
+    """ The `pass` token """
+
+    token_newline: SyntaxToken
+    """ The `new line` token """
+
+    @property
+    def location(self) -> Location:
+        return self.token_pass.location
+
+
+class DocumentationMemberSyntax(MemberSyntax):
+    """ Represents a documentation member syntax node """
+
+    token_string: SyntaxToken
+    """ The documentation's string """
+
+    token_newline: SyntaxToken
+    """ The `new line` token """
+
+    @property
+    def location(self) -> Location:
+        return self.token_string.location
+
+
+class DeclarationSyntax(MemberSyntax, abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+
 # === Generic parameters -----------------------------------------------------------------------------------------------
-class GenericParameterSyntax(SyntaxNode, abc.ABC):
+class GenericParameterSyntax(DeclarationSyntax, abc.ABC):
     """ Represents a generic parameter syntax node """
 
 
@@ -1171,6 +1236,10 @@ class TypeGenericParameterSyntax(GenericParameterSyntax):
 
     token_name: SyntaxToken
     """ The name token """
+
+    @property
+    def name(self) -> str:
+        return self.token_name.value
 
     @property
     def location(self) -> Location:
@@ -1185,6 +1254,10 @@ class VariadicGenericParameterSyntax(GenericParameterSyntax):
 
     token_ellipsis: SyntaxToken
     """ The `...` token """
+
+    @property
+    def name(self) -> str:
+        return self.token_name.value
 
     @property
     def location(self) -> Location:
@@ -1204,6 +1277,10 @@ class ValueGenericParameterSyntax(GenericParameterSyntax):
     """ The value's type """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
@@ -1218,11 +1295,15 @@ class EffectGenericParameterSyntax(GenericParameterSyntax):
     """ The name token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
-class SeparatedGenericParameterSyntax(SyntaxNode):
+class SeparatedGenericParameterSyntax(DeclarationSyntax):
     """ Represents a separated generic parameter syntax node """
 
     parameter: GenericParameterSyntax
@@ -1232,26 +1313,52 @@ class SeparatedGenericParameterSyntax(SyntaxNode):
     """ The optional `,` token """
 
     @property
+    def name(self) -> str:
+        return self.parameter.name
+
+    @property
     def location(self) -> Location:
         return self.parameter.location
 
 
-# === Type members -----------------------------------------------------------------------------------------------------
-class PassMemberSyntax(MemberSyntax):
-    """ Represents a pass member syntax node """
+# === Type aliases -----------------------------------------------------------------------------------------------------
+class UsingDeclarationSyntax(DeclarationSyntax):
+    """ Represents a using syntax node """
 
-    token_pass: SyntaxToken
-    """ The `pass` token """
+    token_using: SyntaxToken
+    """ The `using` token """
+
+    token_name: SyntaxToken
+    """ The field's name """
+
+    token_left_square: SyntaxToken | None
+    """ The optional `[` token """
+
+    generic_parameters: Sequence[SeparatedGenericParameterSyntax]
+    """ The using's generic parameters """
+
+    token_right_square: SyntaxToken | None
+    """ The optional `]` token """
+
+    token_equal: SyntaxToken | None
+    """ The `=` token """
+
+    canonical_type: TypeSyntax
+    """ The field's default value """
 
     token_newline: SyntaxToken
     """ The `new line` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
-        return self.token_pass.location
+        return self.token_name.location
 
 
-class FieldSyntax(MemberSyntax):
+class FieldDeclarationSyntax(DeclarationSyntax):
     """ Represents a field member syntax node """
 
     token_name: SyntaxToken
@@ -1273,11 +1380,15 @@ class FieldSyntax(MemberSyntax):
     """ The `new line` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
-class EnumerationConstantMemberSyntax(MemberSyntax):
+class EnumerationConstantDeclarationSyntax(DeclarationSyntax):
     """ Represents a enumeration constant member syntax node """
 
     token_name: SyntaxToken
@@ -1293,12 +1404,20 @@ class EnumerationConstantMemberSyntax(MemberSyntax):
     """ The `new line` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
 # === Type declarations ------------------------------------------------------------------------------------------------
-class StructSyntax(MemberSyntax):
+class TypeDeclarationSyntax(DeclarationSyntax, abc.ABC):
+    """ Represents a type declaration syntax node """
+
+
+class StructDeclarationSyntax(TypeDeclarationSyntax):
     """ Represents a struct syntax node """
 
     token_struct: SyntaxToken
@@ -1341,11 +1460,15 @@ class StructSyntax(MemberSyntax):
     """ The `dedent` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
-class InterfaceSyntax(MemberSyntax):
+class InterfaceDeclarationSyntax(TypeDeclarationSyntax):
     """ Represents an interface syntax node """
 
     token_interface: SyntaxToken
@@ -1388,11 +1511,15 @@ class InterfaceSyntax(MemberSyntax):
     """ The `dedent` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
-class ClassSyntax(MemberSyntax):
+class ClassDeclarationSyntax(TypeDeclarationSyntax):
     """ Represents a class syntax node """
 
     token_class: SyntaxToken
@@ -1435,11 +1562,15 @@ class ClassSyntax(MemberSyntax):
     """ The `dedent` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
-class EnumerationSyntax(MemberSyntax):
+class EnumerationDeclarationSyntax(TypeDeclarationSyntax):
     """ Represents a enumeration syntax node """
 
     token_enum: SyntaxToken
@@ -1482,12 +1613,57 @@ class EnumerationSyntax(MemberSyntax):
     """ The `dedent` token """
 
     @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
+    def location(self) -> Location:
+        return self.token_name.location
+
+
+class EffectDeclarationSyntax(DeclarationSyntax):
+    """ Represents an effect declaration syntax node """
+    token_effect: SyntaxToken
+    """ The `effect` token """
+
+    token_name: SyntaxToken
+    """ The name token """
+
+    token_left_square: SyntaxToken | None
+    """ The optional `[` token """
+
+    generic_parameters: Sequence[SeparatedGenericParameterSyntax]
+    """ The effect's generic parameters """
+
+    token_right_square: SyntaxToken | None
+    """ The optional `]` token """
+
+    token_colon: SyntaxToken
+    """ The `:` token """
+
+    token_newline: SyntaxToken
+    """ The `new line` token """
+
+    token_indent: SyntaxToken
+    """ The `indent` token """
+
+    members: Sequence[MemberSyntax]
+    """ The sequence of nested members """
+
+    token_dedent: SyntaxToken
+    """ The `dedent` token """
+
+    @property
+    def name(self) -> str:
+        return self.token_name.value
+
+    @property
     def location(self) -> Location:
         return self.token_name.location
 
 
 # === Functions --------------------------------------------------------------------------------------------------------
-class FunctionSyntax(MemberSyntax):
+class FunctionDeclarationSyntax(MemberSyntax):
     """ Represents a function declaration syntax node """
 
     token_def: SyntaxToken
@@ -1578,13 +1754,56 @@ class SeparatedParameterSyntax(SyntaxNode):
         return self.parameter.location
 
 
+class OperatorDeclarationSyntax(MemberSyntax):
+    """ Represents a operator declaration syntax node """
+
+    token_def: SyntaxToken
+    """ The `def` token """
+
+    token_name: SyntaxToken
+    """ The name token """
+
+    token_left_parenthesis: SyntaxToken
+    """ The `(` token """
+
+    parameters: Sequence[SeparatedParameterSyntax]
+    """ The operator's parameters """
+
+    token_right_parenthesis: SyntaxToken
+    """ The `)` token """
+
+    token_arrow: SyntaxToken | None
+    """ The optional `->` token """
+
+    returns: TypeSyntax | None
+    """ The optional operator's return type """
+
+    token_colon: SyntaxToken
+    """ The `:` token """
+
+    token_ellipsis: SyntaxToken
+    """ The `...` token """
+
+    token_newline: SyntaxToken
+    """ The `new line` token """
+
+    @property
+    def name(self) -> str:
+        """ The operator's name """
+        return self.token_name.value
+
+    @property
+    def location(self) -> Location:
+        return self.token_name.location
+
+
 # === Statements -------------------------------------------------------------------------------------------------------
 class StatementSyntax(SyntaxNode, abc.ABC):
     """ Represents an abstract base for any statement syntax nodes """
 
 
 class EllipsisStatementSyntax(StatementSyntax):
-    """ Represents a ellipsis statement syntax node, e.g. node that marked empty function body """
+    """ Represents an ellipsis statement syntax node, e.g. node that marked empty function body """
 
     token_ellipsis: SyntaxToken
     """ The `...` token """
@@ -1944,7 +2163,7 @@ class ExpressionSyntax(SyntaxNode, abc.ABC):
     """ Represents an abstract base for any expression syntax nodes """
 
 
-class SeparatedExpressionSyntax(ExpressionSyntax):
+class SeparatedExpressionSyntax(SyntaxNode):
     """ Represents a separated expression syntax node """
 
     value: ExpressionSyntax

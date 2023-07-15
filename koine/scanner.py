@@ -11,8 +11,8 @@ import tokenize as py_tokenize
 from typing import Sequence, Iterator, Tuple, Pattern, Mapping
 
 from koine.source import SourceText
-from koine.syntax import InternalToken, InternalTrivia, TokenID, OPEN_BRACKETS, CLOSE_BRACKETS, TRIVIA, KEYWORDS, \
-    IMPLICITS, SyntaxBuilder
+from koine.syntax import InternalToken, InternalTrivia, TokenID, OPEN_BRACKETS, CLOSE_BRACKETS, TRIVIA, \
+    IMPLICITS, SyntaxBuilder, KEYWORDS_MAPPING
 
 
 def fetch_syntax_tokens(source: SourceText) -> Sequence[InternalToken]:
@@ -167,7 +167,6 @@ def _compile_regexp(*patterns: Tuple[TokenID, str]) -> Tuple[Pattern, Mapping[st
     return re.compile('|'.join(regex_parts)), groups
 
 
-KEYWORDS_MAPPING = {key_id.description: key_id for key_id in KEYWORDS}
 TOKEN_REGEXP, TOKEN_MAPPING = _compile_regexp(
     # implicit patterns
     *((key_id, re.escape(key_id.description))

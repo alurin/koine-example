@@ -1,37 +1,40 @@
-using Bool = ...
+using any = ...
+""" Represents an any type. This type is used as dynamic marker """
+
+using bool = ...
 """ Represents a boolean type """
 
-using Integer = ...
+using int = ...
 """ Represents a integer type """
 
-using Float = ...
+using float = ...
 """ Represents a float type """
 
-using String = ...
+using str = ...
 """ Represents a string type """
 
-using Type = ...
-""" Represents a runtime metatype """
+#using Type = ...
+#""" Represents a runtime metatype """
 
 
-def typeof(value: Any) -> Type:
-    """ Returns runtime type of value """
+#def typeof(value: any) -> Type:
+#    """ Returns runtime type of value """
 
 
-def issubclass(self: Type, other: Type) -> Bool:
-    """ Returns True, if `self` is subclass for `other` type  """
+#def issubclass(self: Type, other: Type) -> bool:
+#    """ Returns True, if `self` is subclass for `other` type  """
 
 
-def isinstance(value: Any, type: Type) -> Bool:
-    """ Returns True, if value is instance of type """
-    return issubclass(typeof(value), type)
+#def isinstance(value: any, type: Type) -> bool:
+#    """ Returns True, if value is instance of type """
+#    return issubclass(typeof(value), type)
 
 
 effect Raise[Ex]:
     """ Represents an effect of exception handling """
-    def raise(ex: Ex) -> Nothing: ...
+    def raise(ex: Ex) -> nothing: ...
 
 
-effect Yield[S, I]:
+effect Yield[I, S]:
     """ Represents an effect of iterator yielding """
     def yield(elem: I) -> S: ...

@@ -90,17 +90,13 @@ class Parser:
         node = self.__builder.make_node(node_class, children or ())
         self.push(node)  # push
 
-    def consume_context(self, index: TokenID):
-        assert index in CONTEXTUAL_KEYWORDS
-        if self.current.id != TokenID.Identifier or self.current.value != index.description:
-            raise self.error((index,))
-
-        trivia = self.__builder.make_trivia(index, self.current.value)
-        token = self.__builder.make_token(trivia, self.current.leading_trivia, self.current.trailing_trivia)
-        self.push(token)
-        self.advance()
-
     def consume(self, index: TokenID):
+        if index in CONTEXTUAL_KEYWORDS and self.current.id == TokenID.Identifier:
+            trivia = self.__builder.make_trivia(index, self.current.value)
+            token = self.__builder.make_token(trivia, self.current.leading_trivia, self.current.trailing_trivia)
+            self.push(token)
+            return self.advance()
+
         if self.current.id != index:
             raise self.error((index,))
 
@@ -172,28 +168,23 @@ class TableParselet(Parselet):
             assert token_id not in self.__prefixes
             self.__prefixes[token_id] = parselet
 
+    def get_prefix(self, token: InternalToken) -> Parselet:
+        if token.context_id and (entry := self.__prefixes.get(token.context_id)):
+            return entry
+        return self.__prefixes.get(token.id)
+
     def match(self, parser: Parser, rbp: int = 0):
-        if prefix_parselet := self.__prefixes.get(parser.current.id):
-            prefix_parselet.match(parser)
-            return
+        if prefix_parselet := self.get_prefix(parser.current):
+            return prefix_parselet.match(parser)
 
         raise parser.error(set(self.__prefixes.keys()))
 
 
-class PrattParselet(Parselet):
+class PrattParselet(TableParselet):
     def __init__(self):
-        self.__prefixes: MutableMapping[TokenID, Parselet] = {}
+        super().__init__()
+
         self.__postfixes: MutableMapping[TokenID, Tuple[int, Parselet]] = {}
-
-    @property
-    def prefixes(self) -> Sequence[TokenID]:
-        return tuple(self.__prefixes.keys())
-
-    def add_prefix(self, index_or_indexes: TokenID | Iterable[TokenID], parselet: Parselet):
-        indexes = (index_or_indexes,) if isinstance(index_or_indexes, TokenID) else index_or_indexes
-        for token_id in indexes:
-            assert token_id not in self.__prefixes
-            self.__prefixes[token_id] = parselet
 
     def add_postfix(self, index_or_indexes: TokenID | Iterable[TokenID], lbp: int, parselet: Parselet):
         assert BINDING_MIN <= lbp <= BINDING_MAX
@@ -202,16 +193,21 @@ class PrattParselet(Parselet):
             assert token_id not in self.__postfixes
             self.__postfixes[token_id] = (lbp, parselet)
 
+    def get_postfix(self, token: InternalToken) -> Tuple[int, Parselet]:
+        if token.context_id and (entry := self.__postfixes.get(token.context_id)):
+            return entry
+        return self.__postfixes.get(token.id)
+
     def match(self, parser: Parser, rbp: int = 0):
-        if prefix_parselet := self.__prefixes.get(parser.current.id):
+        if prefix_parselet := self.get_prefix(parser.current):
             # prefix
             prefix_parselet.match(parser)
         else:
             # error
-            raise parser.error(set(self.__prefixes.keys()))
+            raise parser.error(set(self.prefixes))
 
         # postfix
-        while postfix_entry := self.__postfixes.get(parser.current.id):
+        while postfix_entry := self.get_postfix(parser.current):
             lbp, postfix_parselet = postfix_entry
             if rbp >= lbp:
                 break
@@ -244,12 +240,6 @@ class TokenCombinator(Combinator):
 
     def fill(self, parser: Parser):
         parser.push(None)
-
-
-@attr.dataclass(frozen=True, slots=True)
-class ContextTokenCombinator(TokenCombinator):
-    def match(self, parser: Parser):
-        parser.consume_context(self.token_id)
 
 
 @attr.dataclass(frozen=True, slots=True)
@@ -344,19 +334,15 @@ class RepeatCombinator(Combinator):
             while True:
                 try:
                     self.combinator.match(parser)
+                    count += 1
                 except ParserError:
                     if min_count <= count < max_count:
                         break
                     raise
-                else:
-                    count += 1
 
     def fill(self, parser: Parser):
         # () => []
-        min_count, _ = self.mode.repeat_limits
-        with parser.stack(SyntaxSequence):
-            for _ in range(min_count):
-                self.combinator.fill(parser)
+        parser.new(SyntaxSequence)
 
 
 @attr.dataclass(frozen=True, slots=True)
@@ -374,9 +360,11 @@ class SeparateCombinator(Combinator):
         with parser.stack(SyntaxSequence):
             while True:
                 try:
-                    with parser.stack(self.node_class):
+                    with parser.stack(self.node_class):  # TODO: stack is not exception safity
                         # combinator
                         self.combinator.match(parser)
+
+                        count += 1
 
                         # separator
                         try:
@@ -390,17 +378,10 @@ class SeparateCombinator(Combinator):
                     if min_count <= count < max_count:
                         break
                     raise
-                else:
-                    count += 1
 
     def fill(self, parser: Parser):
         # () => []
-        min_count, _ = self.mode.repeat_limits
-        with parser.stack(SyntaxSequence):
-            for _ in range(min_count):
-                with parser.stack(self.node_class):
-                    self.combinator.fill(parser)
-                    self.separator.fill(parser)
+        parser.new(SyntaxSequence)
 
 
 @attr.dataclass(frozen=True, slots=True)
@@ -450,10 +431,6 @@ def make_token(token_id: TokenID) -> TokenCombinator:
     return TokenCombinator(token_id)
 
 
-def make_context_token(token_id: TokenID) -> ContextTokenCombinator:
-    return ContextTokenCombinator(token_id)
-
-
 def make_reference(rule: Parselet, rbp: int = BINDING_DEFAULT) -> ReferenceCombinator:
     return ReferenceCombinator(rule, rbp)
 
@@ -471,6 +448,20 @@ def make_sequence(*combinators: Declaration) -> Combinator | SequenceCombinator:
             return combinators[0]
         case _:
             return SequenceCombinator(combinators)
+
+
+def make_alternative(*combinators: Declaration) -> Combinator:
+    combinators = tuple(flat_combinators(combinators, SequenceCombinator))
+    match len(combinators):
+        case 0:
+            raise RuntimeError(f'Can not create alternative combinator for empty sequence')
+        case 1:
+            return combinators[0]
+        case _:
+            parselet = AlternativeParselet()
+            for combinator in combinators:
+                parselet.add_prefix(make_parselet(None, combinator))
+            return flat_declaration(parselet)
 
 
 def make_empty_collection() -> EmptySequenceCombinator:
@@ -538,30 +529,42 @@ def make_postfix_type(node_class: Type[SyntaxNode], token_id: TokenID, rbp: int)
     ])
 
 
-def make_type_declaration(node_class: Type[SyntaxNode], token_id: TokenID) -> CombinatorParselet:
+def make_type_declaration(node_class: Type[SyntaxNode], token_id: TokenID,
+                          match_members: Declaration = None) -> CombinatorParselet:
     # type_declaration:
     #   <token_id> Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' type_members
+
+    match_members = match_members or match_type_members
     return make_parselet(node_class, [
         token_id,
         TokenID.Identifier,
         make_optional(match_generic_parameters),
         make_optional(match_type_bases),
         TokenID.Colon,
-        match_type_members,
+        match_members,
+    ])
+
+
+def make_block(match_item: Declaration) -> Combinator:
+    return make_sequence([
+        TokenID.Newline,
+        TokenID.Indent,
+        make_repeat(match_item, mode=RepeatMode.OneOrMany),
+        TokenID.Dedent,
     ])
 
 
 def make_node_list(tuple_class: Type[SyntaxNode], separated_class: Type[SyntaxNode], node_item: Declaration):
     node_list = AlternativeParselet()
 
-    # list := { <item> / ',' }+
-    node_list.add_prefix(
-        make_parselet(tuple_class, make_sequence(
-            make_none(),
-            make_separate(separated_class, node_item, separator=TokenID.Comma, mode=RepeatMode.OneOrMany),
-            make_none(),
-        ))
-    )
+    # # list := { <item> / ',' }+
+    # node_list.add_prefix(
+    #     make_parselet(tuple_class, make_sequence(
+    #         make_none(),
+    #         make_separate(separated_class, node_item, separator=TokenID.Comma, mode=RepeatMode.OneOrMany),
+    #         make_none(),
+    #     ))
+    # )
 
     # list := <item> ','
     node_list.add_prefix(
@@ -620,8 +623,7 @@ match_import_from.add_prefix(make_parselet(FromImportSyntax, [
     TokenID.From,
     match_qualified_name,
     TokenID.Import,
-    # TODO: Require at least one element
-    make_separate(SeparatedAliasSyntax, match_from_alias, separator=TokenID.Comma),
+    make_separate(SeparatedAliasSyntax, match_from_alias, separator=TokenID.Comma, mode=RepeatMode.OneOrMany),
     TokenID.Newline,
 ]))
 
@@ -637,8 +639,7 @@ match_module_alias = make_parselet(ModuleAliasSyntax, [
 # import_module := 'import' module_alias { ',' module_alias } Newline
 match_import_module = make_parselet(ModuleImportSyntax, [
     TokenID.Import,
-    # TODO: Require at least one element
-    make_separate(SeparatedModuleAliasSyntax, match_module_alias, separator=TokenID.Comma),
+    make_separate(SeparatedModuleAliasSyntax, match_module_alias, separator=TokenID.Comma, mode=RepeatMode.OneOrMany),
     TokenID.Newline
 ])
 
@@ -783,7 +784,7 @@ match_generic_parameter = AlternativeParselet()
 
 # generic_parameter := 'effect' Identifier
 match_generic_parameter.add_prefix(make_parselet(EffectGenericParameterSyntax, [
-    make_context_token(TokenID.Effect),
+    TokenID.Effect,
     TokenID.Identifier,
 ]))
 
@@ -806,8 +807,8 @@ match_generic_parameter.add_prefix(make_parselet(TypeGenericParameterSyntax, Tok
 # generic_parameters! := '[' { generic_parameter / ',' } ']'
 match_generic_parameters = make_sequence([
     TokenID.LeftSquare,
-    # TODO: Require at least one element
-    make_separate(SeparatedGenericParameterSyntax, match_generic_parameter, separator=TokenID.Comma),
+    make_separate(
+        SeparatedGenericParameterSyntax, match_generic_parameter, separator=TokenID.Comma, mode=RepeatMode.OneOrMany),
     TokenID.RightSquare,
 ])
 
@@ -824,9 +825,9 @@ match_parameter = make_parselet(ParameterSyntax, [
     ),
 ])
 
-# function := 'def' Identifier [ '[' generic_parameters ']' ] '(' { parameter / ',' } ')' { effect } [ '-> type_list ] ':'
-#               function_statement
-match_function = make_parselet(FunctionSyntax, [
+# function := 'def' Identifier [ '[' generic_parameters ']' ] '(' { parameter / ',' } ')' { effect } [ '-> type_list ]
+#             ':' function_statement
+match_function_declaration = make_parselet(FunctionDeclarationSyntax, [
     TokenID.Def,
     TokenID.Identifier,
     make_optional(match_generic_parameters),
@@ -840,6 +841,26 @@ match_function = make_parselet(FunctionSyntax, [
     ),
     TokenID.Colon,
     match_function_statement
+])
+
+# operator := 'def' Identifier '(' { parameter / ',' } ')' [ '-> type_list ] ':' '...' Newline
+match_operator_declaration = make_parselet(OperatorDeclarationSyntax, [
+    TokenID.Def,
+    make_alternative(
+        TokenID.Identifier,
+        TokenID.Raise,
+        TokenID.Yield,
+    ),
+    TokenID.LeftParenthesis,
+    make_separate(SeparatedParameterSyntax, match_parameter, separator=TokenID.Comma),
+    TokenID.RightParenthesis,
+    make_optional(
+        TokenID.RightArrow,
+        match_type_list,
+    ),
+    TokenID.Colon,
+    TokenID.Ellipsis,
+    TokenID.Newline,
 ])
 
 
@@ -1154,13 +1175,7 @@ match_expression_statement.add_prefix(make_parselet(ExpressionStatementSyntax, [
 match_statement = TableParselet()
 
 # block_statement := Newline Indent { statement } Dedent
-match_block_statement = make_parselet(BlockStatementSyntax, [
-    TokenID.Newline,
-    TokenID.Indent,
-    # TODO: Require at least one element
-    make_repeat(match_statement),
-    TokenID.Dedent,
-])
+match_block_statement = make_parselet(BlockStatementSyntax, make_block(match_statement))
 
 # else_statement := 'else' ':' block
 match_else_statement = make_simple_statement(ElseStatementSyntax, TokenID.Else)
@@ -1253,8 +1268,7 @@ match_try_statement.add_prefix(make_parselet(TryExceptStatementSyntax, [
     TokenID.Try,
     TokenID.Colon,
     match_block_statement,
-    # TODO: Require at least one element
-    make_repeat(match_except_statement),
+    make_repeat(match_except_statement, mode=RepeatMode.OneOrMany),
     make_optional(match_else_statement),
     make_optional(match_finally_statement),
 ]))
@@ -1266,7 +1280,7 @@ match_statement.add_prefix(TokenID.Try, match_try_statement)
 match_field = AlternativeParselet()
 
 # field := Identifier ':' type_list [ '=' expression_list ] Newline
-match_field.add_prefix(make_parselet(FieldSyntax, [
+match_field.add_prefix(make_parselet(FieldDeclarationSyntax, [
     TokenID.Identifier,
     TokenID.Colon,
     match_type_list,
@@ -1289,27 +1303,50 @@ match_enum_value.add_prefix(make_parselet(EllipsisExpressionSyntax, [
 match_enum_value.add_prefix(match_expression)
 
 # field := Identifier '=' enum_value Newline
-match_field.add_prefix(make_parselet(EnumerationConstantMemberSyntax, [
+match_field.add_prefix(make_parselet(EnumerationConstantDeclarationSyntax, [
     TokenID.Identifier,
     TokenID.Equal,
     match_enum_value,
     TokenID.Newline,
 ]))
 
-# === Type members -----------------------------------------------------------------------------------------------------
-match_type_member = TableParselet()
+# === Documentation member ---------------------------------------------------------------------------------------------
+match_documentation = make_parselet(DocumentationMemberSyntax, [
+    TokenID.String,
+    TokenID.Newline,
+])
 
-# type_member := 'pass' Newline
-match_type_member.add_prefix(TokenID.Pass, make_parselet(PassMemberSyntax, [
+# === Pass member ------------------------------------------------------------------------------------------------------
+match_pass = make_parselet(PassMemberSyntax, [
     TokenID.Pass,
     TokenID.Newline
-]))
+])
+
+# === Type members -----------------------------------------------------------------------------------------------------
+match_type_member = TableParselet()
+match_enum_member = TableParselet()
+match_effect_member = TableParselet()
+
+# type_member := 'pass' Newline
+match_type_member.add_prefix(TokenID.Pass, match_pass)
+match_enum_member.add_prefix(TokenID.Pass, match_pass)
+match_effect_member.add_prefix(TokenID.Pass, match_pass)
 
 # type_member := &'def' function
-match_type_member.add_prefix(TokenID.Def, match_function)
+match_type_member.add_prefix(TokenID.Def, match_function_declaration)
+match_enum_member.add_prefix(TokenID.Def, match_function_declaration)
+
+# type_member := &'def' operator
+match_effect_member.add_prefix(TokenID.Def, match_operator_declaration)
 
 # type_member := &Identifier function
 match_type_member.add_prefix(TokenID.Identifier, match_field)
+match_enum_member.add_prefix(TokenID.Identifier, match_field)
+
+# type_member := &String documentation
+match_type_member.add_prefix(TokenID.String, match_documentation)
+match_enum_member.add_prefix(TokenID.String, match_documentation)
+match_effect_member.add_prefix(TokenID.String, match_documentation)
 
 # === Type declarations ------------------------------------------------------------------------------------------------
 match_type_bases = make_sequence(
@@ -1319,43 +1356,74 @@ match_type_bases = make_sequence(
 )
 
 # type_members := Newline Indent { type_member } Dedent
-match_type_members = make_sequence([
-    TokenID.Newline,
-    TokenID.Indent,
-    # TODO: Require at least one element
-    make_repeat(match_type_member),
-    TokenID.Dedent,
-])
+match_type_members = make_block(match_type_member)
+
+# enum_members := Newline Indent { enum_member } Dedent
+match_enum_members = make_block(match_enum_member)
+
+# effect_members := Newline Indent { effect_member } Dedent
+match_effect_members = make_block(match_effect_member)
 
 # struct := 'struct' Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' type_members
-match_struct = make_type_declaration(StructSyntax, TokenID.Struct)
+match_struct_declaration = make_type_declaration(StructDeclarationSyntax, TokenID.Struct)
 
 # class := 'class' Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' type_members
-match_class = make_type_declaration(ClassSyntax, TokenID.Class)
+match_class_declaration = make_type_declaration(ClassDeclarationSyntax, TokenID.Class)
 
 # interface := 'interface' Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' type_members
-match_interface = make_type_declaration(InterfaceSyntax, TokenID.Interface)
+match_interface_declaration = make_type_declaration(InterfaceDeclarationSyntax, TokenID.Interface)
 
-# enum := 'enum' Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' type_members
-match_enum = make_type_declaration(EnumerationSyntax, TokenID.Enum)
+# enum := 'enum' Identifier [ '[' generic_parameters ']' ] [ '(' { type / ',' } ')' ] ':' enum_members
+match_enum_declaration = make_type_declaration(EnumerationDeclarationSyntax, TokenID.Enum, match_enum_members)
+
+# effect := 'effect' Identifier [ '[' generic_parameters ']' ] ':' effect_members
+match_effect_declaration = make_parselet(EffectDeclarationSyntax, [
+    TokenID.Effect,
+    TokenID.Identifier,
+    make_optional(match_generic_parameters),
+    TokenID.Colon,
+    match_effect_members,
+])
+
+# using := 'using' Identifier [ '[' generic_parameters ']' ] '=' [ type | '...' ] Newline
+match_using_declaration = make_parselet(UsingDeclarationSyntax, [
+    TokenID.Using,
+    TokenID.Identifier,
+    make_optional(match_generic_parameters),
+    TokenID.Equal,
+    make_alternative(
+        match_type,
+        make_parselet(EllipsisTypeSyntax, [TokenID.Ellipsis]),
+    ),
+    TokenID.Newline,
+])
 
 # === Module members ---------------------------------------------------------------------------------------------------
 match_module_member = TableParselet()
 
 # module_member := &'def' function
-match_module_member.add_prefix(TokenID.Def, match_function)
+match_module_member.add_prefix(TokenID.Def, match_function_declaration)
 
 # module_member := &'struct' struct
-match_module_member.add_prefix(TokenID.Struct, match_struct)
+match_module_member.add_prefix(TokenID.Struct, match_struct_declaration)
 
 # module_member := &'class' class
-match_module_member.add_prefix(TokenID.Class, match_class)
+match_module_member.add_prefix(TokenID.Class, match_class_declaration)
 
 # module_member := &'interface' interface
-match_module_member.add_prefix(TokenID.Interface, match_interface)
+match_module_member.add_prefix(TokenID.Interface, match_interface_declaration)
 
 # module_member := &'enum' enum
-match_module_member.add_prefix(TokenID.Enum, match_enum)
+match_module_member.add_prefix(TokenID.Enum, match_enum_declaration)
+
+# module_member := &'using' using
+match_module_member.add_prefix(TokenID.Using, match_using_declaration)
+
+# module_member := &'effect' effect
+match_module_member.add_prefix(TokenID.Effect, match_effect_declaration)
+
+# module_member := &'string' documentation
+match_module_member.add_prefix(TokenID.String, match_documentation)
 
 # === Module -----------------------------------------------------------------------------------------------------------
 match_module: Parselet

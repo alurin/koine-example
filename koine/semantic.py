@@ -19,6 +19,18 @@ from koine.source import fetch_source_text
 from koine.strings import quote_identifier as _
 from koine.syntax import SyntaxTree
 
+TypeSyntax: TypeAlias = syntax.TypeSyntax \
+                        | syntax.SeparatedTypeSyntax \
+                        | syntax.UsingDeclarationSyntax \
+                        | syntax.TypeDeclarationSyntax
+
+EffectSyntax: TypeAlias = syntax.EffectSyntax \
+                          | syntax.SeparatedEffectSyntax \
+                          | syntax.EffectDeclarationSyntax
+
+GenericParameterSyntax: TypeAlias = syntax.GenericParameterSyntax \
+                                    | syntax.SeparatedGenericParameterSyntax
+
 
 class Scope(abc.ABC):
     pass
@@ -29,11 +41,18 @@ class SemanticModel:
         self.__tree = tree
         self.__context = HIRContext()
         self.__environments = LazyMapping(functools.partial(annotate_node_environment, self))
-        self.__types = LazyMapping(lambda n: synthesize_type(self.fetch_environment(n), n))
-        self.__effects = LazyMapping(lambda n: synthesize_effect(self.fetch_environment(n), n))
-        self.__functions = LazyMapping(lambda n: synthesize_function(self.fetch_environment(n), n))
-        self.__parameters = LazyMapping(lambda n: synthesize_parameter(self.fetch_environment(n), n))
-        self.__expressions = LazyMapping(lambda n: synthesize_expression(self.fetch_environment(n), n))
+
+        def evaluate_in_environ(evaluate):
+            return lambda n: evaluate(self.fetch_environment(n), n)
+
+        self.__symbols = LazyMapping(functools.partial(annotate_node_symbol, self))
+        self.__types = LazyMapping(evaluate_in_environ(synthesize_type))
+        self.__effects = LazyMapping(evaluate_in_environ(synthesize_effect))
+        self.__functions = LazyMapping(evaluate_in_environ(synthesize_function))
+        self.__parameters = LazyMapping(evaluate_in_environ(synthesize_parameter))
+        self.__expressions = LazyMapping(evaluate_in_environ(synthesize_expression))
+        self.__operators = LazyMapping(evaluate_in_environ(synthesize_operator))
+        self.__type_parameters = LazyMapping(evaluate_in_environ(synthesize_type_parameter))
 
     @property
     def tree(self) -> SyntaxTree:
@@ -50,14 +69,23 @@ class SemanticModel:
     def fetch_environment(self, node: syntax.SyntaxNode) -> AbstractEnvironment:
         return self.__environments[node]
 
-    def fetch_type(self, node: syntax.TypeSyntax) -> HIRType:
+    def fetch_symbol(self, node: syntax.SyntaxNode) -> HIRSymbol | None:
+        return self.__symbols[node]
+
+    def fetch_type(self, node: TypeSyntax) -> HIRType:
         return self.__types[node]
 
-    def fetch_effect(self, node: syntax.EffectSyntax) -> HIREffect:
+    def fetch_type_parameter(self, node: GenericParameterSyntax) -> HIRGenericParameter:
+        return self.__type_parameters[node]
+
+    def fetch_effect(self, node: EffectSyntax) -> HIREffect:
         return self.__effects[node]
 
-    def fetch_function(self, node: syntax.FunctionSyntax) -> HIRFunction:
+    def fetch_function(self, node: syntax.FunctionDeclarationSyntax) -> HIRFunction:
         return self.__functions[node]
+
+    def fetch_operator(self, node: syntax.OperatorDeclarationSyntax) -> HIROperator:
+        return self.__operators[node]
 
     def fetch_parameter(self, node: syntax.SeparatedParameterSyntax | syntax.ParameterSyntax) -> HIRVariable:
         return self.__parameters[node]
@@ -76,14 +104,26 @@ class AbstractEnvironment(abc.ABC):
     def context(self) -> HIRContext:
         return self.model.context
 
-    def fetch_type(self, node: syntax.TypeSyntax) -> HIRType:
+    def fetch_symbol(self, node: syntax.SyntaxNode) -> HIRSymbol | None:
+        return self.model.fetch_symbol(node)
+
+    def fetch_lazy_symbol(self, node: syntax.SyntaxNode) -> Callable[[], HIRSymbol | None]:
+        return lambda: self.fetch_symbol(node)
+
+    def fetch_type(self, node: TypeSyntax) -> HIRType:
         return self.model.fetch_type(node)
 
-    def fetch_effect(self, node: syntax.EffectSyntax) -> HIREffect:
+    def fetch_type_parameter(self, node: GenericParameterSyntax) -> HIRGenericParameter:
+        return self.model.fetch_type_parameter(node)
+
+    def fetch_effect(self, node: EffectSyntax) -> HIREffect:
         return self.model.fetch_effect(node)
 
-    def fetch_function(self, node: syntax.FunctionSyntax) -> HIRFunction:
+    def fetch_function(self, node: syntax.FunctionDeclarationSyntax) -> HIRFunction:
         return self.model.fetch_function(node)
+
+    def fetch_operator(self, node: syntax.OperatorDeclarationSyntax) -> HIROperator:
+        return self.model.fetch_operator(node)
 
     def fetch_parameter(self, node: syntax.SeparatedParameterSyntax | syntax.ParameterSyntax) -> HIRVariable:
         return self.model.fetch_parameter(node)
@@ -112,7 +152,30 @@ class ModuleEnvironment(AbstractEnvironment):
 
     def resolve(self, name: str) -> HIRSymbol | None:
         if self.__scope is None:
-            self.__scope = annotate_module_scope(self, self.node)
+            self.__scope = annotate_node_scope(self, self.node)
+
+        if resolver := self.__scope.get(name):
+            return resolver()
+        return None
+
+
+class DeclarationEnvironment(AbstractEnvironment):
+    def __init__(self, parent: AbstractEnvironment, node: syntax.DeclarationSyntax):
+        self.__parent = parent
+        self.__node = node
+        self.__scope = None
+
+    @property
+    def model(self) -> SemanticModel:
+        return self.__parent.model
+
+    @property
+    def node(self) -> syntax.DeclarationSyntax:
+        return self.__node
+
+    def resolve(self, name: str) -> HIRSymbol | None:
+        if self.__scope is None:
+            self.__scope = annotate_node_scope(self, self.node)
 
         if resolver := self.__scope.get(name):
             return resolver()
@@ -120,7 +183,7 @@ class ModuleEnvironment(AbstractEnvironment):
 
 
 class FunctionEnvironment(AbstractEnvironment):
-    def __init__(self, parent: AbstractEnvironment, node: syntax.FunctionSyntax):
+    def __init__(self, parent: AbstractEnvironment, node: syntax.FunctionDeclarationSyntax):
         self.__parent = parent
         self.__node = node
         self.__environments = {}
@@ -131,7 +194,7 @@ class FunctionEnvironment(AbstractEnvironment):
         return self.__parent.model
 
     @property
-    def node(self) -> syntax.FunctionSyntax:
+    def node(self) -> syntax.FunctionDeclarationSyntax:
         return self.__node
 
     @property
@@ -275,16 +338,18 @@ def fetch_semantic_model(filename: str) -> SemanticModel:
     tree = fetch_syntax_tree(source)
     model = SemanticModel(tree)
 
-    for member in tree.root.members:
-        if isinstance(member, syntax.FunctionSyntax):
-            cast(FunctionEnvironment, model.fetch_environment(member)).check()
-
-            func = model.fetch_function(member)
-            print(func)
+    for child in tree.root.members:
+        if isinstance(child, syntax.DeclarationSyntax):
+            symbol = model.fetch_symbol(child)
+            print(symbol)
+            if isinstance(symbol, HIRContainer):
+                for member in symbol.members:
+                    print('  :>', member)
 
     return model
 
 
+# === Node environments ------------------------------------------------------------------------------------------------
 @multimethod.multimethod
 def annotate_node_environment(model: SemanticModel, node: syntax.SyntaxNode) -> AbstractEnvironment:
     return model.fetch_environment(node.parent)
@@ -296,7 +361,22 @@ def annotate_node_environment(model: SemanticModel, node: syntax.ModuleSyntax) -
 
 
 @multimethod.multimethod
-def annotate_node_environment(model: SemanticModel, node: syntax.FunctionSyntax) -> AbstractEnvironment:
+def annotate_node_environment(model: SemanticModel, node: syntax.UsingDeclarationSyntax) -> AbstractEnvironment:
+    return DeclarationEnvironment(model.fetch_environment(node.parent), node)
+
+
+@multimethod.multimethod
+def annotate_node_environment(model: SemanticModel, node: syntax.TypeDeclarationSyntax) -> AbstractEnvironment:
+    return DeclarationEnvironment(model.fetch_environment(node.parent), node)
+
+
+@multimethod.multimethod
+def annotate_node_environment(model: SemanticModel, node: syntax.EffectDeclarationSyntax) -> AbstractEnvironment:
+    return DeclarationEnvironment(model.fetch_environment(node.parent), node)
+
+
+@multimethod.multimethod
+def annotate_node_environment(model: SemanticModel, node: syntax.FunctionDeclarationSyntax) -> AbstractEnvironment:
     return FunctionEnvironment(model.fetch_environment(node.parent), node)
 
 
@@ -304,21 +384,134 @@ def annotate_node_environment(model: SemanticModel, node: syntax.FunctionSyntax)
 def annotate_node_environment(model: SemanticModel, node: syntax.StatementSyntax) -> AbstractEnvironment:
     # Force typing check
     parent = node.parent
-    while not isinstance(parent, syntax.FunctionSyntax):
+    while not isinstance(parent, syntax.FunctionDeclarationSyntax):
         parent = parent.parent
 
     func_env = cast(FunctionEnvironment, model.fetch_environment(parent))
     return func_env.get_environment(node)
 
 
-def annotate_module_scope(env: ModuleEnvironment, root: syntax.ModuleSyntax) -> Mapping[str, Callable[[], HIRSymbol]]:
-    scope = {}
-    for member in root.members:
-        if isinstance(member, syntax.FunctionSyntax):
-            scope[member.name] = (lambda node: lambda: env.fetch_function(node))(member)
-    return scope
+# === Node environments ------------------------------------------------------------------------------------------------
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.SyntaxNode) -> HIRSymbol | None:
+    raise SemanticError(node.location, 'Not implemented symbol annotation')
 
 
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.DocumentationMemberSyntax) -> None:
+    return None
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.GenericParameterSyntax) -> None:
+    return model.fetch_type_parameter(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.SeparatedGenericParameterSyntax) -> HIRGenericParameter:
+    return model.fetch_type_parameter(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.TypeSyntax) -> HIRType:
+    return model.fetch_type(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.SeparatedTypeSyntax) -> HIRType:
+    return model.fetch_type(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.TypeDeclarationSyntax) -> HIRType:
+    return model.fetch_type(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.UsingDeclarationSyntax) -> HIRType:
+    return model.fetch_type(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.EffectSyntax) -> HIREffect:
+    return model.fetch_effect(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.SeparatedEffectSyntax) -> HIREffect:
+    return model.fetch_effect(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.EffectDeclarationSyntax) -> HIREffect:
+    return model.fetch_effect(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.ParameterSyntax) -> HIRVariable:
+    return model.fetch_parameter(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.SeparatedParameterSyntax) -> HIRVariable:
+    return model.fetch_parameter(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.FunctionDeclarationSyntax) -> HIRFunction:
+    return model.fetch_function(node)
+
+
+@multimethod.multimethod
+def annotate_node_symbol(model: SemanticModel, node: syntax.OperatorDeclarationSyntax) -> HIROperator:
+    return model.fetch_operator(node)
+
+
+# === Node scopes ------------------------------------------------------------------------------------------------------
+@multimethod.multimethod
+def annotate_node_scope(env: AbstractEnvironment, node: syntax.SyntaxNode) -> Mapping[str, Callable[[], HIRSymbol]]:
+    raise SemanticError(node.location, 'Not implemented lexical scope')
+
+
+@multimethod.multimethod
+def annotate_node_scope(env: AbstractEnvironment, node: syntax.ModuleSyntax) -> Mapping[str, Callable[[], HIRSymbol]]:
+    return {
+        member.name: env.fetch_lazy_symbol(member)
+        for member in node.members
+        if isinstance(member, syntax.DeclarationSyntax)
+    }
+
+
+@multimethod.multimethod
+def annotate_node_scope(env: AbstractEnvironment, node: syntax.UsingDeclarationSyntax) \
+        -> Mapping[str, Callable[[], HIRSymbol]]:
+    return {param.name: env.fetch_lazy_symbol(param) for param in node.generic_parameters}
+
+
+@multimethod.multimethod
+def annotate_node_scope(env: AbstractEnvironment, node: syntax.EffectDeclarationSyntax) \
+        -> Mapping[str, Callable[[], HIRSymbol]]:
+    return {param.name: env.fetch_lazy_symbol(param) for param in node.generic_parameters}
+
+
+# === Synthesize type parameters ---------------------------------------------------------------------------------------
+@multimethod.multimethod
+def synthesize_type_parameter(env: AbstractEnvironment, node: syntax.GenericParameterSyntax) -> HIRGenericParameter:
+    raise SemanticError(node.location, 'Not implemented parameter annotation')
+
+
+@multimethod.multimethod
+def synthesize_type_parameter(env: AbstractEnvironment,
+                              node: syntax.SeparatedGenericParameterSyntax) -> HIRGenericParameter:
+    return env.fetch_type_parameter(node.parameter)
+
+
+@multimethod.multimethod
+def synthesize_type_parameter(env: AbstractEnvironment, node: syntax.TypeGenericParameterSyntax) -> HIRGenericParameter:
+    return HIRGenericType(env.context, node.name)
+
+
+# === Identifier types -------------------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_identifier_type(env: AbstractEnvironment, node: syntax.IdentifierSyntax) -> HIRType:
     raise SemanticError(node.location, 'Not implemented type annotation for identifier')
@@ -326,7 +519,18 @@ def synthesize_identifier_type(env: AbstractEnvironment, node: syntax.Identifier
 
 @multimethod.multimethod
 def synthesize_identifier_type(env: AbstractEnvironment, node: syntax.SimpleIdentifierSyntax) -> HIRType:
-    match node.name:
+    if symbol := get_identifier_type(env, node.name):
+        return symbol
+
+    if symbol := env.resolve(node.name):
+        if isinstance(symbol, HIRType):
+            return symbol
+        raise SemanticError(node.location, f'Can not use symbol {_(symbol.reference)} as value')
+    raise SemanticError(node.location, f'Not found type {_(node.name)} in current scope')
+
+
+def get_identifier_type(env: AbstractEnvironment, name: str) -> HIRType | None:
+    match name:
         case 'int':
             return HIRIntegerType(env.context)
         case 'str':
@@ -335,12 +539,21 @@ def synthesize_identifier_type(env: AbstractEnvironment, node: syntax.SimpleIden
             return HIRFloatType(env.context)
         case 'bool':
             return HIRBooleanType(env.context)
-    raise SemanticError(node.location, 'Not implemented type annotation for identifier')
+        case 'nothing':
+            return HIRVoidType(env.context)
+        case 'any':
+            return HIRDynamicType(env.context)
 
 
+# === Synthesize type --------------------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_type(env: AbstractEnvironment, node: syntax.TypeSyntax) -> HIRType:
     raise SemanticError(node.location, 'Not implemented type annotation for node')
+
+
+@multimethod.multimethod
+def synthesize_type(env: AbstractEnvironment, node: syntax.SeparatedTypeSyntax) -> HIRType:
+    return env.fetch_type(node.type)
 
 
 @multimethod.multimethod
@@ -361,15 +574,44 @@ def synthesize_type(env: AbstractEnvironment, node: syntax.IdentifierTypeSyntax)
 
 
 @multimethod.multimethod
-def synthesize_effect(env: AbstractEnvironment, node: syntax.EffectSyntax) -> HIRType:
-    raise SemanticError(node.location, 'Not implemented type annotation for node')
+def synthesize_type(env: AbstractEnvironment, node: syntax.UsingDeclarationSyntax) -> HIRType:
+    if node.generic_parameters:
+        raise SemanticError(node.location, 'Not supported type aliases')
+    if not isinstance(node.canonical_type, syntax.EllipsisTypeSyntax):
+        raise SemanticError(node.location, 'Not supported type aliases')
+
+    if symbol := get_identifier_type(env, node.name):
+        return symbol
+
+    raise SemanticError(node.location, 'Not supported type aliases')
 
 
-def synthesize_function(env: AbstractEnvironment, node: syntax.FunctionSyntax) -> HIRFunction:
+# === Synthesize effect ------------------------------------------------------------------------------------------------
+@multimethod.multimethod
+def synthesize_effect(env: AbstractEnvironment, node: syntax.EffectSyntax) -> HIREffect:
+    raise SemanticError(node.location, 'Not implemented effect annotation for node')
+
+
+@multimethod.multimethod
+def synthesize_effect(env: AbstractEnvironment, node: syntax.EffectDeclarationSyntax) -> HIREffect:
+    effect = HIREffect(env.context, node.name)
+    effect.type_parameters = [env.fetch_type_parameter(param) for param in node.generic_parameters]
+    effect.members = lambda: [symbol for member in node.members if (symbol := env.fetch_symbol(member))]
+    return effect
+
+
+# === Synthesize function ----------------------------------------------------------------------------------------------
+def synthesize_function(env: AbstractEnvironment, node: syntax.FunctionDeclarationSyntax) -> HIRFunction:
     parameters = [env.fetch_parameter(param) for param in node.parameters]
     returns = env.fetch_type(node.returns)
     effects = {env.fetch_effect(effect) for effect in node.effects}
     return HIRFunction(node.name, parameters, returns, effects)
+
+
+def synthesize_operator(env: AbstractEnvironment, node: syntax.OperatorDeclarationSyntax) -> HIROperator:
+    parameters = [env.fetch_parameter(param) for param in node.parameters]
+    returns = env.fetch_type(node.returns)
+    return HIROperator(node.name, parameters, returns)
 
 
 @multimethod.multimethod
@@ -383,6 +625,7 @@ def synthesize_parameter(env: AbstractEnvironment, node: syntax.ParameterSyntax)
     return HIRVariable(node.name, param_type)
 
 
+# === Synthesize expression --------------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_expression(env: AbstractEnvironment, node: syntax.ExpressionSyntax) -> HIRSymbol:
     raise SemanticError(node.location, 'Not implemented symbol annotation for node')
@@ -549,7 +792,7 @@ def synthesize_expression_symbol(env: StatementEnvironment, node: syntax.Identif
     if symbol := env.resolve(node.name):
         return env, env, symbol
 
-    raise SemanticError(node.location, f'Not found {_(node.name)} in current scope')
+    raise SemanticError(node.location, f'Not found symbol {_(node.name)} in current scope')
 
 
 @multimethod.multimethod
