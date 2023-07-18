@@ -6,42 +6,24 @@ from __future__ import annotations
 
 import abc
 from functools import cached_property
-from typing import Sequence, Any, Type as PyType, Generic as PyGeneric, AbstractSet, Iterator, Iterable, TypeVar
+from typing import Sequence, Any, Type as PyType, AbstractSet, Iterator
 
 import more_itertools
 
+from koine import core
 from koine import priorities
-from koine.undefined import *
 
 
 # === HIR: context -----------------------------------------------------------------------------------------------------
-class HIRContext(abc.ABC):
+class HIRContext(core.Context['HIRModule']):
     """
     Represents a symbol context, e.g. manager for all shared symbols.
     """
 
-    def __init__(self):
-        self.__registered_modules = set()
-        self.__cached_types = {}
+    def __init__(self, loader: core.Loader[HIRModule]):
+        super().__init__(loader)
+
         self.__cached_constants = {}
-
-    @property
-    def registered_modules(self) -> AbstractSet[HIRModule]:
-        """
-        Returns all global and nested modules that contains in module
-
-        :return: Sequence of modules
-        """
-        return self.__registered_modules
-
-    def _register_module(self, module: HIRModule):
-        self.__registered_modules.add(module)
-
-    def _get_cached_type(self, class_type: PyType, arguments: Sequence[Any]) -> Any:
-        return self.__cached_types.get((class_type, *arguments))
-
-    def _set_cached_type(self, class_type: PyType, arguments: Sequence[Any], instance: Any):
-        self.__cached_types[(class_type, *arguments)] = instance
 
     def _get_cached_constant(self, type: HIRType, value: Any) -> HIRConstant | None:
         return self.__cached_constants.get((type, value))
@@ -51,205 +33,44 @@ class HIRContext(abc.ABC):
 
 
 # === HIR: core --------------------------------------------------------------------------------------------------------
-class HIRSymbol(abc.ABC):
-    def __init__(self):
-        self.__uses = set()
-
-        for node in self.inputs:
-            node.__uses.add(self)
-
+class HIRNode(abc.ABC):
     @property
     @abc.abstractmethod
     def context(self) -> HIRContext:
         raise NotImplementedError
 
-    @property
     @abc.abstractmethod
-    def reference(self) -> str:
-        """ The symbol's reference """
-        raise NotImplementedError
-
-    @property
-    @abc.abstractmethod
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        raise NotImplementedError
-
-    @property
-    def uses(self) -> AbstractSet[HIRSymbol]:
-        return self.__uses
-
     def __str__(self) -> str:
-        return self.reference
+        raise NotImplementedError
 
     def __repr__(self) -> str:
         return str(self)
 
 
-class HIRName(HIRSymbol, abc.ABC):
-    @property
-    @abc.abstractmethod
-    def name(self) -> str:
-        """ The symbol's name """
-        raise NotImplementedError
+class HIRSymbol(core.Symbol[HIRContext], abc.ABC):
+    pass
 
-    @property
-    def reference(self) -> str:
-        """ The symbol's reference """
-        return self.name
+
+class HIRName(core.Name[HIRContext], HIRSymbol, abc.ABC):
+    pass
 
 
 # === HIR: container ---------------------------------------------------------------------------------------------------
-class HIRContainer(HIRSymbol, abc.ABC):
-    __members = Undefined
-
-    @property
-    def members(self) -> Sequence[HIRMember]:
-        self.__members = unwrap_undefined(self.__members, self._unwrap_members)
-        return load_undefined(self.__members)
-
-    @members.setter
-    def members(self, value: Iterable[HIRMember]):
-        self.__members = wrap_undefined(self.__members, value, self._unwrap_members)
-
-    def _unwrap_members(self, members: Iterable[HIRMember]) -> Sequence[HIRMember]:
-        members = tuple(members)
-        for member in members:
-            member.owner = self
-        return members
+class HIRContainer(core.Container[HIRContext, 'HIRMember'], HIRSymbol, abc.ABC):
+    pass
 
 
-class HIRMember(HIRSymbol, abc.ABC):
-    @property
-    def context(self) -> HIRContext:
-        return self.parent.context
-
-    @property
-    @abc.abstractmethod
-    def parent(self) -> HIRContainer:
-        raise NotImplementedError
+class HIRMember(core.Member[HIRContext, HIRContainer], abc.ABC):
+    pass
 
 
 # === HIR: generics ----------------------------------------------------------------------------------------------------
-TGeneric = TypeVar('TGeneric', bound='Generic')
-
-
-class HIRGeneric(HIRName, PyGeneric[TGeneric], abc.ABC):
-    """ Represents an interface for all generic symbols """
-
-    __original = Undefined
-    __type_parameters = Undefined
-    __type_arguments = Undefined
-
-    @property
-    def reference(self) -> str:
-        return self.generic_name
-
-    @property
-    def generic_name(self) -> str:
-        """ The symbol's name with type arguments """
-        if self.type_arguments:
-            parameters = ', '.join(param.reference for param in self.type_arguments)
-            return f'{self.name}[{parameters}]'
-        return self.name
-
-    @property
-    def is_generic(self) -> bool:
-        return bool(self.type_parameters)
-
-    @property
-    def original(self) -> TGeneric | None:
-        """ The original definition of this generic symbol. """
-        return self.__original or None
-
-    @original.setter
-    def original(self, value: TGeneric | None):
-        """ Assign original definition of this generic symbol """
-        self.__original = store_undefined(self.__original, value)
-
-    @property
-    def type_parameters(self) -> Sequence[HIRGenericParameter]:
-        """
-        The type parameters that this generic symbol has.
-
-        If this is a non-generic symbol, returns an empty sequence
-        """
-        return self.__type_parameters or ()
-
-    @type_parameters.setter
-    def type_parameters(self, value: Sequence[HIRGenericParameter]):
-        """ Assign the type parameters that this generic symbol has """
-        self.__type_parameters = wrap_undefined(self.__type_parameters, value, self.unwrap_type_parameters)
-        self.__type_arguments = store_undefined(self.__type_arguments, self.__type_parameters)
-        self.__original = store_undefined(self.__original, None)
-
-        # TODO: Cache generic type?
-
-    @property
-    def type_arguments(self) -> Sequence[HIRGenericArgument]:
-        """
-        Returns the type arguments that have been substituted for the type parameters.
-
-        If nothing has been substituted for a given type parameter, then the type parameter itself is considered the
-        type argument.
-        """
-
-        self.__type_arguments = unwrap_undefined(self.__type_arguments, tuple)
-        return self.__type_arguments or self.type_parameters
-
-    @type_arguments.setter
-    def type_arguments(self, value: Sequence[HIRGenericArgument]):
-        """
-        Assign the type arguments that have been substituted for the type parameters.
-        """
-        if not self.original:
-            raise RuntimeError('Can not set type argument before origin')
-
-        self.__type_arguments = wrap_undefined(self.__type_arguments, value, tuple)
-        self.__type_parameters = store_undefined(self.__type_parameters, ())
-
-        # TODO: Cache generic type?
-
-    def unwrap_type_parameters(self, parameters: Iterable[HIRGenericParameter]) -> Sequence[HIRGenericParameter]:
-        parameters = tuple(parameters)
-        for param in parameters:
-            param.declared_symbol = self
-        return parameters
-
-    # def instantiate(self, module: Module, type_arguments: Sequence[GenericArgument]) -> TGeneric:
-    #     """ Instantiate this generic symbol with type arguments that substituted for the type parameters """
-    #     if not self.is_generic:
-    #         raise ValueError(f'Can not instantiate symbol: non generic {self}')
-    #
-    #     if len(self.type_parameters) != len(type_arguments):
-    #         raise ValueError(f'Can not instantiate symbol: mismatch count of type arguments')
-    #
-    #     mapping = RewriteMapper(module, zip(self.type_parameters, type_arguments))
-    #     if self.original:
-    #         type_arguments = tuple(mapping.rewrite(param) for param in self.type_arguments)
-    #         return self.original.instantiate(module, type_arguments)
-    #
-    #     return mapping.instantiate(self)
-
-
-class HIRGenericArgument(HIRSymbol, abc.ABC):
+class HIRGenericArgument(core.GenericArgument[HIRContext], HIRSymbol, abc.ABC):
     """ Represents an interface for all symbols that can be used as generic argument """
 
 
-class HIRGenericParameter(HIRName, HIRGenericArgument, abc.ABC):
+class HIRGenericParameter(core.GenericParameter[HIRContext], HIRGenericArgument, abc.ABC):
     """ Represents an interface for all symbols that can be used as generic parameter """
-    __declared_symbol = Undefined
-
-    @property
-    def declared_symbol(self) -> HIRGeneric | None:
-        return load_undefined(self.__declared_symbol)
-
-    @declared_symbol.setter
-    def declared_symbol(self, value: HIRGeneric):
-        self.__declared_symbol = store_undefined(self.__declared_symbol, value)
-
-    @property
-    def is_generic(self) -> bool:
-        return False
 
 
 # === HIR: module ------------------------------------------------------------------------------------------------------
@@ -308,10 +129,6 @@ class HIRModule(HIRName, HIRContainer):
         """
         return self.__registered_functions
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset()  # The module has not input dependencies
-
     def _register_effect(self, effect: HIREffect):
         self.__registered_effects.add(effect)
 
@@ -323,7 +140,7 @@ class HIRModule(HIRName, HIRContainer):
 
 
 # === HIR: effects -----------------------------------------------------------------------------------------------------
-class HIREffect(HIRGeneric, HIRContainer):
+class HIREffect(core.Generic[HIRContext, HIRContainer, 'HIREffect', HIRGenericParameter, HIRGenericArgument]):
     def __init__(self, context: HIRContext, name: str):
         self.__context = context
         self.__name = name
@@ -337,10 +154,6 @@ class HIREffect(HIRGeneric, HIRContainer):
     @property
     def name(self) -> str:
         return self.__name
-
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset()
 
 
 class HIROperator(HIRName):
@@ -366,10 +179,6 @@ class HIROperator(HIRName):
     @property
     def returns(self) -> HIRType:
         return self.__returns
-
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset((*self.__parameters, self.__returns))
 
     def __str__(self) -> str:
         parameters = ', '.join(str(param) for param in self.parameters)
@@ -399,10 +208,6 @@ class HIRGenericType(HIRGenericParameter, HIRType):
     @property
     def name(self) -> str:
         return self.__name
-
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset()
 
 
 class _HIRTypeConstructorArgumentMeta(abc.ABCMeta):
@@ -502,10 +307,6 @@ class HIRPrimitiveType(HIRType, abc.ABC, metaclass=_HIRTypeConstructorArgumentMe
     def context(self) -> HIRContext:
         return self.__context
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return set()
-
     def __eq__(self, other: HIRType) -> bool:
         return isinstance(other, type(self))
 
@@ -590,10 +391,6 @@ class HIRFunctionType(HIRType, metaclass=_HIRTypeConstructorFunctionMeta):
         """ The result type of function type """
         return self.__returns
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset((*self.__parameters, *self.__effects, self.__returns))
-
     def __hash__(self) -> int:
         return hash(tuple((type(self), self.__returns, *self.__parameters, *self.__effects)))
 
@@ -623,10 +420,6 @@ class HIRArrayType(HIRType, metaclass=_HIRTypeConstructorSingleMeta):
     def element_type(self) -> HIRType:
         return self.__element_type
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return {self.__element_type}
-
 
 class HIRTupleType(HIRType, metaclass=_HIRTypeConstructorSequenceMeta):
     def __init__(self, context: HIRContext, elements: Sequence[HIRType]):
@@ -646,10 +439,6 @@ class HIRTupleType(HIRType, metaclass=_HIRTypeConstructorSequenceMeta):
     @property
     def elements(self) -> Sequence[HIRType]:
         return self.__elements
-
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset(self.__elements)
 
 
 class HIRUnionType(HIRType, metaclass=_HIRTypeConstructorSetMeta):
@@ -671,16 +460,12 @@ class HIRUnionType(HIRType, metaclass=_HIRTypeConstructorSetMeta):
     def reference(self) -> str:
         return ' | '.join(type_parenthesis(self, element) for element in self.elements)
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return self.__elements
-
 
 # === HIR: values ------------------------------------------------------------------------------------------------------
 class HIRValue(HIRSymbol, abc.ABC):
     @property
     def context(self) -> HIRContext:
-        return self.context
+        return self.type.context
 
     @property
     @abc.abstractmethod
@@ -706,10 +491,6 @@ class HIRConstant(HIRValue):
     @property
     def value(self) -> Any:
         return self.__value
-
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return {self.__type}
 
 
 class HIRFunction(HIRName, HIRValue):
@@ -747,10 +528,6 @@ class HIRFunction(HIRName, HIRValue):
         effects = {effect for effect in self.__effects}
         return HIRFunctionType(parameters, self.__returns, effects)
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset((*self.__parameters, self.__returns))
-
     def __str__(self) -> str:
         parameters = ', '.join(str(param) for param in self.parameters)
         effects = ' '.join(effect.reference for effect in self.__effects)
@@ -775,10 +552,6 @@ class HIRVariable(HIRName, HIRValue):
     def __str__(self) -> str:
         return f'{self.__name}: {self.__type.reference}'
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return {self.__type}
-
 
 class HIRTuple(HIRValue):
     def __init__(self, context: HIRContext, elements: Sequence[HIRValue]):
@@ -801,12 +574,13 @@ class HIRTuple(HIRValue):
         elements = [element.type for element in self.__elements]
         return HIRTupleType(self.__context, elements)
 
-    @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset((self.type, *self.elements))
+
+# === HIR: statements and expressions ----------------------------------------------------------------------------------
+class HIRInstruction(HIRNode, abc.ABC):
+    pass
 
 
-class HIRCall(HIRValue):
+class HIRCallInst(HIRInstruction, HIRValue):
     def __init__(self, functor: HIRFunction, arguments: Sequence[HIRValue]):
         self.__returns = functor.returns
         self.__functor = functor
@@ -820,7 +594,7 @@ class HIRCall(HIRValue):
 
     @property
     def reference(self) -> str:
-        arguments = ', '.join(arg.reference for arg in self.arguments)
+        arguments = ', '.join(arg.reference for arg in self.__arguments)
         return f'{self.__functor.reference}({arguments})'
 
     @property
@@ -831,9 +605,130 @@ class HIRCall(HIRValue):
     def arguments(self):
         return self.__arguments
 
+
+class HIRApplyInst(HIRInstruction, HIRValue):
+    def __init__(self, operator: HIROperator, arguments: Sequence):
+        self.__returns = operator.returns
+        self.__operator = operator
+        self.__arguments = tuple(arguments)
+
+        super().__init__()
+
     @property
-    def inputs(self) -> AbstractSet[HIRSymbol]:
-        return frozenset((self.__returns, self.__functor, *self.__arguments))
+    def reference(self) -> str:
+        arguments = ', '.join(arg.reference for arg in self.__arguments)
+        return f'{self.__operator.reference}({arguments})'
+
+    @property
+    def operator(self) -> HIROperator:
+        return self.__operator
+
+    @property
+    def arguments(self) -> Sequence[HIRValue]:
+        return self.__arguments
+
+    @property
+    def type(self) -> HIRType:
+        return self.__returns
+
+
+class HIRReturnInst(HIRInstruction):
+    def __init__(self, value: HIRValue):
+        self.__value = value
+
+        super().__init__()
+
+    @property
+    def context(self) -> HIRContext:
+        return self.__value.context
+
+    def __str__(self) -> str:
+        return f'return {self.__value.reference}'
+
+
+class HIREvalInst(HIRInstruction):
+    def __init__(self, value: HIRValue):
+        self.__value = value
+
+        super().__init__()
+
+    @property
+    def context(self) -> HIRContext:
+        return self.__value.context
+
+    def __str__(self) -> str:
+        return f'eval {self.__value.reference}'
+
+
+class HIRRegionInst(HIRInstruction):
+    def __init__(self, instructions: Sequence[HIRInstruction]):
+        assert len(instructions) > 0
+
+        self.__context = instructions[0].context
+        self.__instructions = instructions
+        super().__init__()
+
+    @property
+    def context(self) -> HIRContext:
+        return self.__context
+
+    @property
+    def instructions(self) -> Sequence[HIRInstruction]:
+        return self.__instructions
+
+    def __str__(self) -> str:
+        return '\n'.join(str(inst) for inst in self.__instructions)
+
+
+class HIRBreakInst(HIRInstruction):
+    def __init__(self, condition: HIRValue, then_block: HIRInstruction, else_block: HIRInstruction | None):
+        self.__condition = condition
+        self.__then_block = then_block
+        self.__else_block = else_block
+
+        super().__init__()
+
+    @property
+    def context(self) -> HIRContext:
+        return self.__condition.context
+
+    @property
+    def condition(self) -> HIRValue:
+        return self.__condition
+
+    @property
+    def then_block(self) -> HIRInstruction:
+        return self.__then_block
+
+    @property
+    def else_block(self) -> HIRInstruction | None:
+        return self.__else_block
+
+    def __str__(self) -> str:
+        return f'break {self.__condition.reference} ... ...'
+
+
+class HIRLoopInst(HIRInstruction):
+    def __init__(self, condition: HIRValue, block: HIRInstruction):
+        self.__condition = condition
+        self.__block = block
+
+        super().__init__()
+
+    @property
+    def context(self) -> HIRContext:
+        return self.__condition.context
+
+    @property
+    def condition(self) -> HIRValue:
+        return self.__condition
+
+    @property
+    def block(self) -> HIRInstruction:
+        return self.__block
+
+    def __str__(self) -> str:
+        return f'break {self.__condition.reference} ... ...'
 
 
 # === HIR: set helpers -------------------------------------------------------------------------------------------------

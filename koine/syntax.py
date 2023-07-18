@@ -1663,7 +1663,7 @@ class EffectDeclarationSyntax(DeclarationSyntax):
 
 
 # === Functions --------------------------------------------------------------------------------------------------------
-class FunctionDeclarationSyntax(MemberSyntax):
+class FunctionDeclarationSyntax(DeclarationSyntax):
     """ Represents a function declaration syntax node """
 
     token_def: SyntaxToken

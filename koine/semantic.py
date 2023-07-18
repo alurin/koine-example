@@ -31,6 +31,8 @@ EffectSyntax: TypeAlias = syntax.EffectSyntax \
 GenericParameterSyntax: TypeAlias = syntax.GenericParameterSyntax \
                                     | syntax.SeparatedGenericParameterSyntax
 
+ExpressionSyntax = syntax.ExpressionSyntax | syntax.SeparatedExpressionSyntax
+
 
 class Scope(abc.ABC):
     pass
@@ -39,7 +41,7 @@ class Scope(abc.ABC):
 class SemanticModel:
     def __init__(self, tree: SyntaxTree):
         self.__tree = tree
-        self.__context = HIRContext()
+        self.__context = HIRContext(None)
         self.__environments = LazyMapping(functools.partial(annotate_node_environment, self))
 
         def evaluate_in_environ(evaluate):
@@ -50,7 +52,6 @@ class SemanticModel:
         self.__effects = LazyMapping(evaluate_in_environ(synthesize_effect))
         self.__functions = LazyMapping(evaluate_in_environ(synthesize_function))
         self.__parameters = LazyMapping(evaluate_in_environ(synthesize_parameter))
-        self.__expressions = LazyMapping(evaluate_in_environ(synthesize_expression))
         self.__operators = LazyMapping(evaluate_in_environ(synthesize_operator))
         self.__type_parameters = LazyMapping(evaluate_in_environ(synthesize_type_parameter))
 
@@ -90,8 +91,8 @@ class SemanticModel:
     def fetch_parameter(self, node: syntax.SeparatedParameterSyntax | syntax.ParameterSyntax) -> HIRVariable:
         return self.__parameters[node]
 
-    def fetch_expression(self, node: syntax.ExpressionSyntax) -> HIRSymbol:
-        return self.__expressions[node]
+    def fetch_typing(self, node: syntax.FunctionDeclarationSyntax):
+        return cast(FunctionEnvironment, self.fetch_environment(node)).check()
 
 
 class AbstractEnvironment(abc.ABC):
@@ -220,14 +221,15 @@ class FunctionEnvironment(AbstractEnvironment):
         self.check()  # TODO: Force there?
         return self.__environments.get(node)
 
-    def check_stmt(self, env: StatementEnvironment, node: syntax.StatementSyntax) -> StatementEnvironment:
-        return self.__execute_in_statement(env, node, check_statement_types)
+    def check_stmt(self, env: StatementEnvironment, node: syntax.StatementSyntax) -> SemanticInstruction:
+        return self.__execute_in_statement(env, node, synthesize_instruction)
 
-    def check_bool(self, env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
-        return self.__execute_in_expression(env, node, check_boolean_type)
+    def synthesize_bool(self, env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
+        return self.__execute_in_expression(env, node, synthesize_boolean_value)
 
-    def check_type(self, env: StatementEnvironment, node: syntax.ExpressionSyntax, expected: HIRType) -> SemanticValue:
-        return self.__execute_in_expression(env, node, check_expression_type, expected)
+    def synthesize_checked(self, env: StatementEnvironment, node: syntax.ExpressionSyntax,
+                           expected: HIRType) -> SemanticValue:
+        return self.__execute_in_expression(env, node, synthesize_checked_value, expected)
 
     def synthesize_value(self, env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
         return self.__execute_in_expression(env, node, synthesize_expression_value)
@@ -240,9 +242,10 @@ class FunctionEnvironment(AbstractEnvironment):
             raise SemanticError(node.location, 'Statement is already type checked')
 
         self.__environments[node] = env  # temporary environment for type checking
-        env = annotator(env, node, *args)
+        env, inst = annotator(env, node, *args)
+        self.__symbols[node] = inst
         self.__environments[node] = env
-        return env
+        return env, inst
 
     def __execute_in_expression(self, env: StatementEnvironment, node: syntax.ExpressionSyntax, annotator, *args):
         if node in self.__symbols:
@@ -284,19 +287,19 @@ class StatementEnvironment(AbstractEnvironment):
     def returns(self) -> HIRType:
         return self.__parent.returns
 
-    def check_stmt(self, node: syntax.StatementSyntax) -> StatementEnvironment:
+    def check_stmt(self, node: syntax.StatementSyntax) -> SemanticInstruction:
         return self.__parent.check_stmt(self, node)
 
-    def check_bool(self, node: syntax.ExpressionSyntax) -> SemanticValue:
-        return self.__parent.check_bool(self, node)
+    def check_bool(self, node: ExpressionSyntax) -> SemanticValue:
+        return self.__parent.synthesize_bool(self, node)
 
-    def check_type(self, node: syntax.ExpressionSyntax, expected: HIRType) -> SemanticValue:
-        return self.__parent.check_type(self, node, expected)
+    def check_type(self, node: ExpressionSyntax, expected: HIRType) -> SemanticValue:
+        return self.__parent.synthesize_checked(self, node, expected)
 
-    def synthesize_value(self, node: syntax.ExpressionSyntax) -> SemanticValue:
+    def synthesize_value(self, node: ExpressionSyntax) -> SemanticValue:
         return self.__parent.synthesize_value(self, node)
 
-    def synthesize_symbol(self, node: syntax.ExpressionSyntax) -> SemanticSymbol:
+    def synthesize_symbol(self, node: ExpressionSyntax) -> SemanticSymbol:
         return self.__parent.synthesize_symbol(self, node)
 
     def declare(self, name: str, type: HIRType) -> Tuple[StatementEnvironment, HIRVariable]:
@@ -331,6 +334,7 @@ class StatementEnvironment(AbstractEnvironment):
 
 SemanticSymbol: TypeAlias = Tuple[StatementEnvironment, StatementEnvironment, HIRSymbol]
 SemanticValue: TypeAlias = Tuple[StatementEnvironment, StatementEnvironment, HIRValue]
+SemanticInstruction: TypeAlias = Tuple[StatementEnvironment, HIRInstruction | None]
 
 
 def fetch_semantic_model(filename: str) -> SemanticModel:
@@ -345,6 +349,9 @@ def fetch_semantic_model(filename: str) -> SemanticModel:
             if isinstance(symbol, HIRContainer):
                 for member in symbol.members:
                     print('  :>', member)
+
+            if isinstance(child, syntax.FunctionDeclarationSyntax):
+                model.fetch_typing(child)
 
     return model
 
@@ -586,6 +593,12 @@ def synthesize_type(env: AbstractEnvironment, node: syntax.UsingDeclarationSynta
     raise SemanticError(node.location, 'Not supported type aliases')
 
 
+# === Synthesize expression --------------------------------------------------------------------------------------------
+@multimethod.multimethod
+def synthesize_expression(env: AbstractEnvironment, node: syntax.ExpressionSyntax) -> HIRSymbol:
+    raise SemanticError(node.location, 'Not implemented symbol annotation for node')
+
+
 # === Synthesize effect ------------------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_effect(env: AbstractEnvironment, node: syntax.EffectSyntax) -> HIREffect:
@@ -625,95 +638,109 @@ def synthesize_parameter(env: AbstractEnvironment, node: syntax.ParameterSyntax)
     return HIRVariable(node.name, param_type)
 
 
-# === Synthesize expression --------------------------------------------------------------------------------------------
+# === Check statement types --------------------------------------------------------------------------------------------
 @multimethod.multimethod
-def synthesize_expression(env: AbstractEnvironment, node: syntax.ExpressionSyntax) -> HIRSymbol:
-    raise SemanticError(node.location, 'Not implemented symbol annotation for node')
-
-
-@multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.StatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.StatementSyntax) -> SemanticInstruction:
     raise SemanticError(node.location, 'Not implemented type checking for statement')
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, _: syntax.EllipsisStatementSyntax) -> StatementEnvironment:
-    return env  # Nothing checked
+def synthesize_instruction(env: StatementEnvironment, _: syntax.EllipsisStatementSyntax) -> SemanticInstruction:
+    return env, None  # Nothing checked
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, _: syntax.PassStatementSyntax) -> StatementEnvironment:
-    return env  # Nothing checked
+def synthesize_instruction(env: StatementEnvironment, _: syntax.PassStatementSyntax) -> SemanticInstruction:
+    return env, None  # Nothing checked
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.ElseStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.ElseStatementSyntax) -> SemanticInstruction:
     return env.check_stmt(node.statement)  # Check nested statement
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.FinallyStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.FinallyStatementSyntax) -> SemanticInstruction:
     return env.check_stmt(node.statement)  # Check nested statement
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.BlockStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.BlockStatementSyntax) -> SemanticInstruction:
+    instructions = []
     for stmt in node.statements:
-        env = env.check_stmt(stmt)
-    return env
+        env, inst = env.check_stmt(stmt)
+        instructions.append(inst)
+    return env, HIRRegionInst(instructions)
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.ExpressionStatementSyntax) -> StatementEnvironment:
-    env, _, _ = env.synthesize_symbol(node.value)
-    return env
+def synthesize_instruction(env: StatementEnvironment, node: syntax.ExpressionStatementSyntax) -> SemanticInstruction:
+    env, _, symbol = env.synthesize_symbol(node.value)
+    if isinstance(symbol, HIRValue):
+        return env, HIREvalInst(symbol)
+    return env, None  # Nothing there?
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.ReturnStatementSyntax) -> StatementEnvironment:
-    env, _, _ = env.check_type(node.value, env.returns)
-    return env
+def synthesize_instruction(env: StatementEnvironment, node: syntax.ReturnStatementSyntax) -> SemanticInstruction:
+    env, _, value = env.check_type(node.value, env.returns)
+    return env, HIRReturnInst(value)
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.IfStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.IfStatementSyntax) -> SemanticInstruction:
     true_env, false_env, condition = env.check_bool(node.condition)
 
-    true_env = true_env.check_stmt(node.then_statement)
+    true_env, true_block = true_env.check_stmt(node.then_statement)
     if node.else_statement:
-        false_env = false_env.check_stmt(node.else_statement)
+        false_env, false_block = false_env.check_stmt(node.else_statement)
+    else:
+        false_block = None
 
-    return true_env | false_env
+    return true_env | false_env, HIRBreakInst(condition, true_block, false_block)
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.WhileStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.WhileStatementSyntax) -> SemanticInstruction:
     true_env, false_env, condition = env.check_bool(node.condition)
 
     # TODO: find closure for `while` body
     while True:
-        body_env = true_env.check_stmt(node.statement)
+        body_env, body_block = true_env.check_stmt(node.statement)
         if body_env == true_env:
             break
         true_env = body_env | body_env  # new body environment
 
-    return true_env | false_env
+    return true_env | false_env, HIRLoopInst(condition, body_block)
 
 
 @multimethod.multimethod
-def check_statement_types(env: StatementEnvironment, node: syntax.AssignmentStatementSyntax) -> StatementEnvironment:
+def synthesize_instruction(env: StatementEnvironment, node: syntax.AssignmentStatementSyntax) -> SemanticInstruction:
     return check_assignment_types(env, node.target, node.source)
 
 
 @multimethod.multimethod
+def synthesize_instruction(env: StatementEnvironment, node: syntax.RaiseStatementSyntax) -> SemanticInstruction:
+    env, _, exception = env.synthesize_value(node.exception)
+
+    raise_eff: HIREffect = env.find_builtin_effect('Raise')
+    raise_eff = raise_eff.instantiate([exception.type])
+    raise_op = more_itertools.first(member for member in raise_eff.members if member.name == 'raise')
+    assert isinstance(raise_op, HIROperator)
+    # TODO: Check operator
+    return env, HIRApplyInst(raise_op, [exception])
+
+
+# === Check assignments ------------------------------------------------------------------------------------------------
+@multimethod.multimethod
 def check_assignment_types(env: StatementEnvironment, target: syntax.TargetSyntax, source: syntax.ExpressionSyntax) \
-        -> StatementEnvironment:
+        -> SemanticInstruction:
     raise SemanticError(target.location, 'Not implemented value assignment for target')
 
 
 @multimethod.multimethod
 def check_assignment_types(env: StatementEnvironment, target: syntax.IdentifierExpressionSyntax,
-                           source: syntax.ExpressionSyntax) -> StatementEnvironment:
+                           source: syntax.ExpressionSyntax) -> SemanticInstruction:
     if env.resolve(target.name):
         raise SemanticError(target.location, 'Reassignment is not implemented')
 
@@ -722,8 +749,9 @@ def check_assignment_types(env: StatementEnvironment, target: syntax.IdentifierE
     return env
 
 
+# === Check boolean type -----------------------------------------------------------------------------------------------
 @multimethod.multimethod
-def check_boolean_type(env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
+def synthesize_boolean_value(env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
     true_env, false_env, value = env.synthesize_value(node)
     actual = value.type
 
@@ -734,13 +762,16 @@ def check_boolean_type(env: StatementEnvironment, node: syntax.ExpressionSyntax)
                         f'Can not use value of type {_(actual.reference)} in boolean context')
 
 
+# === Check expression type --------------------------------------------------------------------------------------------
 @multimethod.multimethod
-def check_expression_type(env: StatementEnvironment, node: syntax.ExpressionSyntax, expected: HIRType) -> SemanticValue:
+def synthesize_checked_value(env: StatementEnvironment, node: syntax.ExpressionSyntax,
+                             expected: HIRType) -> SemanticValue:
     raise SemanticError(node.location, 'Not implemented type checking for statement')
 
 
 @multimethod.multimethod
-def check_expression_type(env: StatementEnvironment, node: syntax.ExpressionSyntax, expected: HIRType) -> SemanticValue:
+def synthesize_checked_value(env: StatementEnvironment, node: syntax.ExpressionSyntax,
+                             expected: HIRType) -> SemanticValue:
     true_env, false_env, value = env.synthesize_value(node)
     actual = value.type
 
@@ -753,6 +784,7 @@ def check_expression_type(env: StatementEnvironment, node: syntax.ExpressionSynt
                         f'Can not convert value of type {_(actual.reference)} to {_(expected.reference)}')
 
 
+# === Synthesize expression value --------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_expression_value(env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticValue:
     true_env, false_env, symbol = env.synthesize_symbol(node)
@@ -762,6 +794,7 @@ def synthesize_expression_value(env: StatementEnvironment, node: syntax.Expressi
     raise SemanticError(node.location, f'Can not use symbol {_(symbol.reference)} as value')
 
 
+# === Synthesize expression symbol -------------------------------------------------------------------------------------
 @multimethod.multimethod
 def synthesize_expression_symbol(env: StatementEnvironment, node: syntax.ExpressionSyntax) -> SemanticSymbol:
     raise SemanticError(node.location, 'Not implemented symbol annotation for expression')
@@ -823,4 +856,4 @@ def synthesize_expression_symbol(env: StatementEnvironment, node: syntax.CallExp
         env, _, arg = env.check_type(arg_node, param.type)
         arguments.append(arg)
 
-    return env, env, HIRCall(functor, arguments)
+    return env, env, HIRCallInst(functor, arguments)
